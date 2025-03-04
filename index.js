@@ -35,6 +35,16 @@ async function setLocalStorage(data) {
   }
 }
 
+async function isValidProxy(proxy) {
+  try {
+    new HttpsProxyAgent(proxy); // Coba inisialisasi proxy
+    return true;
+  } catch (error) {
+    console.error(`Invalid proxy: ${proxy}`);
+    return false;
+  }
+}
+
 async function getProxy() {
   try {
     const proxyData = await readFileAsync('dataProxy.txt', 'utf8');
@@ -43,10 +53,17 @@ async function getProxy() {
       console.log('No proxies found in dataProxy.txt. Using default settings.');
       return null;
     }
-    // Pilih proxy secara acak
-    const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
-    console.log(`Using proxy: ${randomProxy}`);
-    return randomProxy;
+
+    // Looping untuk mencari proxy valid
+    for (const proxy of proxies) {
+      if (await isValidProxy(proxy)) {
+        console.log(`Using valid proxy: ${proxy}`);
+        return proxy;
+      }
+    }
+
+    console.log('No valid proxies found. Using default settings.');
+    return null;
   } catch (error) {
     console.error('Error reading dataProxy.txt:', error.message);
     return null;
@@ -61,7 +78,12 @@ async function connectWebSocket(token, proxy) {
 
   const options = {};
   if (proxy) {
-    options.agent = new HttpsProxyAgent(proxy);
+    try {
+      options.agent = new HttpsProxyAgent(proxy); // Pastikan proxy valid
+    } catch (error) {
+      console.error(`Failed to use proxy: ${proxy}. Using default connection.`);
+      proxy = null; // Gunakan koneksi default jika proxy gagal
+    }
   }
 
   socket = new WebSocket(wsUrl, options);
