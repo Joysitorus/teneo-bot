@@ -1,22 +1,8 @@
 const WebSocket = require('ws');
 const { promisify } = require('util');
 const fs = require('fs');
-const readline = require('readline');
 const axios = require('axios');
-const HttpsProxyAgent = require('https-proxy-agent');
-
-// Helper functions for file operations
-const readFileAsync = promisify(fs.readFile);
-const writeFileAsync = promisify(fs.writeFile);
-
-// Read environment variables from .env file
-require('dotenv').config();
-
-// Initialize readline interface
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 let socket = null;
 let pingInterval;
@@ -26,66 +12,80 @@ let countdown = "Calculating...";
 let pointsTotal = 0;
 let pointsToday = 0;
 
-// Load environment variables
-const auth = process.env.AUTH_TOKEN;
-const email = process.env.EMAIL;
-const password = process.env.PASSWORD;
+const readFileAsync = promisify(fs.readFile);
+const writeFileAsync = promisify(fs.writeFile);
 
 async function getLocalStorage() {
   try {
     const data = await readFileAsync('localStorage.json', 'utf8');
     return JSON.parse(data);
   } catch (error) {
-    console.error("Error reading localStorage.json:", error.message);
+    console.error('Error reading localStorage.json:', error.message);
     return {};
   }
 }
 
 async function setLocalStorage(data) {
+  const currentData = await getLocalStorage();
+  const newData = { ...currentData, ...data };
   try {
-    const currentData = await getLocalStorage();
-    const newData = { ...currentData, ...data };
     await writeFileAsync('localStorage.json', JSON.stringify(newData));
   } catch (error) {
-    console.error("Error writing to localStorage.json:", error.message);
+    console.error('Error writing to localStorage.json:', error.message);
+  }
+}
+
+async function getProxy() {
+  try {
+    const proxyData = await readFileAsync('dataProxy.txt', 'utf8');
+    const proxies = proxyData.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    if (proxies.length === 0) {
+      console.log('No proxies found in dataProxy.txt. Using default settings.');
+      return null;
+    }
+    // Pilih proxy secara acak
+    const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
+    console.log(`Using proxy: ${randomProxy}`);
+    return randomProxy;
+  } catch (error) {
+    console.error('Error reading dataProxy.txt:', error.message);
+    return null;
   }
 }
 
 async function connectWebSocket(token, proxy) {
   if (socket) return;
-
   const version = "v0.2";
   const url = "wss://secure.ws.teneo.pro";
   const wsUrl = `${url}/websocket?accessToken=${encodeURIComponent(token)}&version=${encodeURIComponent(version)}`;
 
-  const options = { agent: new HttpsProxyAgent(proxy) };
+  const options = {};
+  if (proxy) {
+    options.agent = new HttpsProxyAgent(proxy);
+  }
 
   socket = new WebSocket(wsUrl, options);
 
   socket.onopen = async () => {
     const connectionTime = new Date().toISOString();
     await setLocalStorage({ lastUpdated: connectionTime });
-    console.log("WebSocket connected at", connectionTime);
+    console.log("WebSocket connected at ", connectionTime);
     startPinging();
     startCountdownAndPoints();
   };
 
   socket.onmessage = async (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      console.log("Received message from WebSocket:", data);
-      if (data.pointsTotal !== undefined && data.pointsToday !== undefined) {
-        const lastUpdated = new Date().toISOString();
-        await setLocalStorage({
-          lastUpdated: lastUpdated,
-          pointsTotal: data.pointsTotal,
-          pointsToday: data.pointsToday,
-        });
-        pointsTotal = data.pointsTotal;
-        pointsToday = data.pointsToday;
-      }
-    } catch (error) {
-      console.error("Error handling WebSocket message:", error.message);
+    const data = JSON.parse(event.data);
+    console.log("Received message from WebSocket:", data);
+    if (data.pointsTotal !== undefined && data.pointsToday !== undefined) {
+      const lastUpdated = new Date().toISOString();
+      await setLocalStorage({
+        lastUpdated: lastUpdated,
+        pointsTotal: data.pointsTotal,
+        pointsToday: data.pointsToday,
+      });
+      pointsTotal = data.pointsTotal;
+      pointsToday = data.pointsToday;
     }
   };
 
@@ -143,95 +143,76 @@ function startCountdownAndPoints() {
 }
 
 async function updateCountdownAndPoints() {
-  try {
-    const { lastUpdated, pointsTotal, pointsToday } = await getLocalStorage();
-    if (lastUpdated) {
-      const nextHeartbeat = new Date(lastUpdated);
-      nextHeartbeat.setMinutes(nextHeartbeat.getMinutes() + 15);
-      const now = new Date();
-      const diff = nextHeartbeat.getTime() - now.getTime();
+  const { lastUpdated, pointsTotal, pointsToday } = await getLocalStorage();
+  if (lastUpdated) {
+    const nextHeartbeat = new Date(lastUpdated);
+    nextHeartbeat.setMinutes(nextHeartbeat.getMinutes() + 15);
+    const now = new Date();
+    const diff = nextHeartbeat.getTime() - now.getTime();
 
-      if (diff > 0) {
-        const minutes = Math.floor(diff / 60000);
-        const seconds = Math.floor((diff % 60000) / 1000);
-        countdown = `${minutes}m ${seconds}s`;
+    if (diff > 0) {
+      const minutes = Math.floor(diff / 60000);
+      const seconds = Math.floor((diff % 60000) / 1000);
+      countdown = `${minutes}m ${seconds}s`;
 
-        const maxPoints = 25;
-        const timeElapsed = now.getTime() - new Date(lastUpdated).getTime();
-        const timeElapsedMinutes = timeElapsed / (60 * 1000);
-        let newPoints = Math.min(maxPoints, (timeElapsedMinutes / 15) * maxPoints);
+      const maxPoints = 25;
+      const timeElapsed = now.getTime() - new Date(lastUpdated).getTime();
+      const timeElapsedMinutes = timeElapsed / (60 * 1000);
+      let newPoints = Math.min(maxPoints, (timeElapsedMinutes / 15) * maxPoints);
+      newPoints = parseFloat(newPoints.toFixed(2));
+
+      if (Math.random() < 0.1) {
+        const bonus = Math.random() * 2;
+        newPoints = Math.min(maxPoints, newPoints + bonus);
         newPoints = parseFloat(newPoints.toFixed(2));
-
-        if (Math.random() < 0.1) {
-          const bonus = Math.random() * 2;
-          newPoints = Math.min(maxPoints, newPoints + bonus);
-          newPoints = parseFloat(newPoints.toFixed(2));
-        }
-
-        potentialPoints = newPoints;
-      } else {
-        countdown = "Calculating...";
-        potentialPoints = 25;
       }
+
+      potentialPoints = newPoints;
     } else {
       countdown = "Calculating...";
-      potentialPoints = 0;
+      potentialPoints = 25;
     }
-    console.log("Total Points:", pointsTotal, "| Today Points:", pointsToday, "| Countdown:", countdown);
-    await setLocalStorage({ potentialPoints, countdown });
-  } catch (error) {
-    console.error("Error updating countdown and points:", error.message);
+  } else {
+    countdown = "Calculating...";
+    potentialPoints = 0;
   }
+  console.log("Total Points:", pointsTotal, "| Today Points:", pointsToday, "| Countdown:", countdown);
+  await setLocalStorage({ potentialPoints, countdown });
 }
 
-async function getUserId(proxy) {
-  const loginUrl = "https://auth.teneo.pro/api/login";
-
+async function loadAccessToken() {
   try {
-    const response = await axios.post(
-      loginUrl,
-      { email: email, password: password },
-      {
-        headers: {
-          'x-api-key': process.env.REFF_CODE,
-        },
-        httpsAgent: new HttpsProxyAgent(proxy),
+    const envData = await readFileAsync('.env', 'utf8');
+    const envVars = {};
+    envData.split('\n').forEach(line => {
+      const [key, value] = line.split('=');
+      if (key && value) {
+        envVars[key.trim()] = value.trim();
       }
-    );
-
-    const access_token = response.data.access_token;
-
-    await setLocalStorage({ access_token });
-    await startCountdownAndPoints();
-    await connectWebSocket(access_token, proxy);
+    });
+    return envVars.ACCESS_TOKEN || null;
   } catch (error) {
-    console.error("Error during login:", error.response ? error.response.data : error.message);
+    console.error('Error loading .env file:', error.message);
+    return null;
   }
 }
 
 async function main() {
-  try {
-    // Read proxy from dataProxy.txt
-    const proxy = await readFileAsync('dataProxy.txt', 'utf8').then((data) => data.trim());
-    if (!proxy) {
-      console.error("Proxy is required but not found in dataProxy.txt. Exiting...");
+  const localStorageData = await getLocalStorage();
+  let access_token = localStorageData.access_token;
+
+  if (!access_token) {
+    access_token = await loadAccessToken();
+    console.log("Loaded access token from .env:", access_token); // Debugging line
+    if (!access_token) {
+      console.error("Access token not found in localStorage or .env file. Exiting...");
       process.exit(1);
     }
-
-    const localStorageData = await getLocalStorage();
-    let access_token = localStorageData.access_token;
-
-    if (!access_token) {
-      console.log("Access token not found. Logging in...");
-      await getUserId(proxy);
-    } else {
-      console.log("Access token found. Starting WebSocket connection...");
-      await startCountdownAndPoints();
-      await connectWebSocket(access_token, proxy);
-    }
-  } catch (error) {
-    console.error("Error in main function:", error.message);
   }
+
+  const proxy = await getProxy(); // Ambil proxy secara acak dari file
+  await startCountdownAndPoints();
+  await connectWebSocket(access_token, proxy); // Gunakan proxy yang dipilih
 }
 
 // Run the program
