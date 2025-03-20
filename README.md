@@ -11,8 +11,8 @@
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/Joysitorus/layeredge-bot
-   cd layeredge-bot
+   git clone https://github.com/Joysitorus/teneo-bot
+   cd teneo-bot
    ```
 2. Install dependencies:
    ```bash
