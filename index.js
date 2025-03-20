@@ -5,7 +5,16 @@ const readline = require('readline');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-let sockets = []; // Array untuk menyimpan semua koneksi WebSocket
+// Global error handling
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+let sockets = [];
 let pingIntervals = [];
 let countdownInterval;
 let potentialPoints = 0;
@@ -32,9 +41,9 @@ async function getLocalStorage() {
 }
 
 async function setLocalStorage(data) {
-  const currentData = await getLocalStorage();
-  const newData = { ...currentData, ...data };
   try {
+    const currentData = await getLocalStorage();
+    const newData = { ...currentData, ...data };
     await writeFileAsync('localStorage.json', JSON.stringify(newData));
   } catch (error) {
     console.error('Error writing to localStorage.json:', error.message);
@@ -43,7 +52,7 @@ async function setLocalStorage(data) {
 
 async function isValidProxy(proxy) {
   try {
-    new HttpsProxyAgent(proxy); // Coba inisialisasi proxy
+    new HttpsProxyAgent(proxy);
     return true;
   } catch (error) {
     console.error(`Invalid proxy: ${proxy}`);
@@ -55,19 +64,14 @@ async function getProxies() {
   try {
     const proxyData = await readFileAsync('dataProxy.txt', 'utf8');
     const proxies = proxyData.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-    if (proxies.length === 0) {
-      console.log('No proxies found in dataProxy.txt. Using default settings.');
-      return [];
-    }
-
-    // Filter hanya proxy yang valid
     const validProxies = [];
+    
     for (const proxy of proxies) {
       if (await isValidProxy(proxy)) {
         validProxies.push(proxy);
       }
     }
-
+    
     console.log(`Found ${validProxies.length} valid proxies.`);
     return validProxies;
   } catch (error) {
@@ -82,60 +86,13 @@ async function loadAccessToken() {
     const envVars = {};
     envData.split('\n').forEach(line => {
       const [key, value] = line.split('=');
-      if (key && value) {
-        envVars[key.trim()] = value.trim();
-      }
+      if (key && value) envVars[key.trim()] = value.trim();
     });
     return envVars.ACCESS_TOKEN || null;
   } catch (error) {
     console.error('Error loading .env file:', error.message);
     return null;
   }
-}
-
-async function connectWebSocket(token, proxy) {
-  const version = "v0.2";
-  const url = "wss://secure.ws.teneo.pro";
-  const wsUrl = `${url}/websocket?accessToken=${encodeURIComponent(token)}&version=${encodeURIComponent(version)}`;
-
-  const options = {};
-  if (proxy) {
-    options.agent = new HttpsProxyAgent(proxy);
-  }
-
-  const socket = new WebSocket(wsUrl, options);
-
-  socket.onopen = async () => {
-    const connectionTime = new Date().toISOString();
-    console.log(`WebSocket connected via proxy: ${proxy} at ${connectionTime}`);
-    startPinging(socket);
-  };
-
-  socket.onmessage = async (event) => {
-    const data = JSON.parse(event.data);
-    console.log(`Received message from WebSocket via proxy: ${proxy}:`, data);
-    if (data.pointsTotal !== undefined && data.pointsToday !== undefined) {
-      const lastUpdated = new Date().toISOString();
-      await setLocalStorage({
-        lastUpdated: lastUpdated,
-        pointsTotal: data.pointsTotal,
-        pointsToday: data.pointsToday,
-      });
-      pointsTotal = data.pointsTotal;
-      pointsToday = data.pointsToday;
-    }
-  };
-
-  socket.onclose = () => {
-    console.log(`WebSocket disconnected via proxy: ${proxy}`);
-    stopPinging(socket);
-  };
-
-  socket.onerror = (error) => {
-    console.error(`WebSocket error via proxy: ${proxy}:`, error.message);
-  };
-
-  return socket;
 }
 
 function startPinging(socket) {
@@ -152,96 +109,159 @@ function stopPinging(socket) {
   if (index !== -1) {
     clearInterval(pingIntervals[index]);
     pingIntervals.splice(index, 1);
+    sockets.splice(index, 1);
   }
 }
 
-function disconnectAllWebSockets() {
-  sockets.forEach(socket => {
-    if (socket) {
-      socket.close();
-    }
-  });
-  sockets = [];
-  pingIntervals.forEach(interval => clearInterval(interval));
-  pingIntervals = [];
-}
+async function connectWebSocket(token, proxy) {
+  const version = "v0.2";
+  const url = "wss://secure.ws.teneo.pro";
+  const wsUrl = `${url}/websocket?accessToken=${encodeURIComponent(token)}&version=${encodeURIComponent(version)}`;
 
-process.on('SIGINT', () => {
-  console.log('Received SIGINT. Stopping pinging and disconnecting all WebSockets...');
-  disconnectAllWebSockets();
-  process.exit(0);
-});
+  let reconnectAttempts = 0;
+  const maxReconnectAttempts = 5;
+  let socket;
 
-function startCountdownAndPoints() {
-  clearInterval(countdownInterval);
-  updateCountdownAndPoints();
-  countdownInterval = setInterval(updateCountdownAndPoints, 60 * 1000); // 1 minute interval
+  const connect = async () => {
+    const options = proxy ? { agent: new HttpsProxyAgent(proxy) } : {};
+    socket = new WebSocket(wsUrl, options);
+
+    socket.onopen = async () => {
+      reconnectAttempts = 0;
+      console.log(`Connected via ${proxy || 'direct'}`);
+      startPinging(socket);
+    };
+
+    socket.onmessage = async (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log(`Received update via ${proxy || 'direct'}:`, data);
+        
+        if (data.pointsTotal !== undefined && data.pointsToday !== undefined) {
+          await setLocalStorage({
+            lastUpdated: new Date().toISOString(),
+            pointsTotal: data.pointsTotal,
+            pointsToday: data.pointsToday
+          });
+          pointsTotal = data.pointsTotal;
+          pointsToday = data.pointsToday;
+        }
+      } catch (error) {
+        console.error('Message handling error:', error);
+      }
+    };
+
+    socket.onclose = () => {
+      console.log(`Disconnected from ${proxy || 'direct'}. Reconnecting...`);
+      stopPinging(socket);
+      
+      if (reconnectAttempts < maxReconnectAttempts) {
+        const delay = Math.min(5000 * (reconnectAttempts + 1), 30000);
+        setTimeout(connect, delay);
+        reconnectAttempts++;
+      }
+    };
+
+    socket.onerror = (error) => {
+      console.error(`Connection error (${proxy || 'direct'}):`, error.message);
+    };
+  };
+
+  await connect();
+  return socket;
 }
 
 async function updateCountdownAndPoints() {
-  const { lastUpdated, pointsTotal, pointsToday } = await getLocalStorage();
-  if (lastUpdated) {
-    const nextHeartbeat = new Date(lastUpdated);
-    nextHeartbeat.setMinutes(nextHeartbeat.getMinutes() + 15);
-    const now = new Date();
-    const diff = nextHeartbeat.getTime() - now.getTime();
+  try {
+    const localStorageData = await getLocalStorage();
+    const lastUpdated = localStorageData.lastUpdated;
+    const pointsTotal = Number(localStorageData.pointsTotal) || 0;
+    const pointsToday = Number(localStorageData.pointsToday) || 0;
 
-    if (diff > 0) {
-      const minutes = Math.floor(diff / 60000);
-      const seconds = Math.floor((diff % 60000) / 1000);
-      countdown = `${minutes}m ${seconds}s`;
+    if (lastUpdated) {
+      const nextHeartbeat = new Date(lastUpdated);
+      nextHeartbeat.setMinutes(nextHeartbeat.getMinutes() + 15);
+      const now = new Date();
+      const diff = nextHeartbeat.getTime() - now.getTime();
 
-      const maxPoints = 25;
-      const timeElapsed = now.getTime() - new Date(lastUpdated).getTime();
-      const timeElapsedMinutes = timeElapsed / (60 * 1000);
-      let newPoints = Math.min(maxPoints, (timeElapsedMinutes / 15) * maxPoints);
-      newPoints = parseFloat(newPoints.toFixed(2));
+      if (diff > 0) {
+        const minutes = Math.floor(diff / 60000);
+        const seconds = Math.floor((diff % 60000) / 1000);
+        countdown = `${minutes}m ${seconds}s`;
 
-      if (Math.random() < 0.1) {
-        const bonus = Math.random() * 2;
-        newPoints = Math.min(maxPoints, newPoints + bonus);
-        newPoints = parseFloat(newPoints.toFixed(2));
+        const timeElapsed = now.getTime() - new Date(lastUpdated).getTime();
+        let newPoints = Math.min(25, (timeElapsed / (15 * 60 * 1000)) * 25);
+        newPoints = Math.random() < 0.1 ? 
+          Math.min(25, newPoints + Math.random() * 2) : newPoints;
+        potentialPoints = parseFloat(newPoints.toFixed(2));
+      } else {
+        countdown = "Calculating...";
+        potentialPoints = 25;
       }
-
-      potentialPoints = newPoints;
-    } else {
-      countdown = "Calculating...";
-      potentialPoints = 25;
     }
-  } else {
-    countdown = "Calculating...";
-    potentialPoints = 0;
+    
+    console.log(`Points: Total=${pointsTotal} Today=${pointsToday} | Next: ${countdown}`);
+    await setLocalStorage({ potentialPoints, countdown });
+  } catch (error) {
+    console.error('Countdown update error:', error);
   }
-  console.log("Total Points:", pointsTotal, "| Today Points:", pointsToday, "| Countdown:", countdown);
-  await setLocalStorage({ potentialPoints, countdown });
+}
+
+function startCountdownAndPoints() {
+  updateCountdownAndPoints();
+  countdownInterval = setInterval(updateCountdownAndPoints, 60000);
+}
+
+function healthCheck() {
+  setInterval(() => {
+    sockets.forEach((socket, index) => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        console.log(`Reconnecting dead connection #${index}`);
+        stopPinging(socket);
+        socket.removeAllListeners();
+        sockets.splice(index, 1);
+      }
+    });
+  }, 300000); // 5-minute health check
 }
 
 async function main() {
-  const localStorageData = await getLocalStorage();
-  let access_token = localStorageData.access_token;
+  try {
+    const localStorageData = await getLocalStorage();
+    let access_token = localStorageData.access_token || await loadAccessToken();
 
-  if (!access_token) {
-    access_token = await loadAccessToken(); // Memuat token dari file .env
-    console.log("Loaded access token from .env:", access_token);
     if (!access_token) {
-      console.error("Access token not found in localStorage or .env file. Exiting...");
+      console.error("No access token found");
       process.exit(1);
     }
-  }
 
-  const proxies = await getProxies(); // Ambil semua proxy valid
-  if (proxies.length === 0) {
-    console.log("No valid proxies found. Using default connection.");
-    const socket = await connectWebSocket(access_token, null);
-    sockets.push(socket);
-  } else {
-    // Buat koneksi WebSocket untuk setiap proxy
-    for (const proxy of proxies) {
-      const socket = await connectWebSocket(access_token, proxy);
-      sockets.push(socket);
+    const proxies = await getProxies();
+    if (proxies.length === 0) {
+      console.log("Using direct connection");
+      sockets.push(await connectWebSocket(access_token, null));
+    } else {
+      for (const proxy of proxies) {
+        sockets.push(await connectWebSocket(access_token, proxy));
+      }
     }
+
+    startCountdownAndPoints();
+    healthCheck();
+  } catch (error) {
+    console.error('Initialization failed:', error);
+    process.exit(1);
   }
 }
 
-// Run the program
+process.on('SIGINT', () => {
+  console.log('Shutting down gracefully...');
+  clearInterval(countdownInterval);
+  sockets.forEach(socket => {
+    socket.close();
+    socket.removeAllListeners();
+  });
+  pingIntervals.forEach(clearInterval);
+  process.exit(0);
+});
+
 main();
